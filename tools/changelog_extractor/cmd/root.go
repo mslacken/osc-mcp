@@ -10,10 +10,10 @@ import (
 	"os"
 	"strings"
 
+	"github.com/hbollon/go-edlib"
 	"github.com/openSUSE/osc-mcp/internal/pkg/osc"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -21,11 +21,13 @@ var (
 	outputFile string
 )
 
-type Config struct {
-	Files []string `yaml:"files"`
-}
+// type Config struct {
+// 	Files []string `yaml:"files"`
+// }
 
 type Output struct {
+	Name           string            `json:"name"`
+	Version        string            `json:"version"`
 	Changelog      string            `json:"changelog"`
 	AddedFiles     []string          `json:"added_files"`
 	RemovedFiles   []string          `json:"removed_files"`
@@ -52,24 +54,21 @@ type Entry struct {
 	Md5  string `xml:"md5,attr"`
 }
 
+type PackageTarget struct {
+	Project  string
+	Package  string
+	Revision string
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "changelog_extractor [project] [package] [revision]",
 	Short: "Extract changelog, added/removed files, and specified files from OBS",
 	Args:  cobra.ExactArgs(3),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		project := args[0]
-		pkg := args[1]
-		revision := args[2]
-
-		var config Config
-		if cfgFile != "" {
-			b, err := os.ReadFile(cfgFile)
-			if err != nil {
-				return fmt.Errorf("failed to read config file: %w", err)
-			}
-			if err := yaml.Unmarshal(b, &config); err != nil {
-				return fmt.Errorf("failed to parse config file: %w", err)
-			}
+		target := PackageTarget{
+			Project:  args[0],
+			Package:  args[1],
+			Revision: args[2],
 		}
 
 		credsVal, err := osc.GetCredentials()
@@ -78,19 +77,21 @@ var rootCmd = &cobra.Command{
 		}
 		creds := &credsVal
 
-		prevRevision, err := getPreviousRevision(creds, project, pkg, revision)
+		prevRevision, err := getPreviousRevision(creds, target)
 		if err != nil {
 			slog.Warn("could not determine previous revision, assuming none", "error", err)
 		}
 
-		currentFiles, err := getDirectory(creds, project, pkg, revision)
+		currentFiles, err := getDirectory(creds, target)
 		if err != nil {
 			return fmt.Errorf("failed to get current directory: %w", err)
 		}
 
 		var prevFiles *Directory
 		if prevRevision != "" {
-			prevFiles, err = getDirectory(creds, project, pkg, prevRevision)
+			prevTarget := target
+			prevTarget.Revision = prevRevision
+			prevFiles, err = getDirectory(creds, prevTarget)
 			if err != nil {
 				slog.Warn("failed to get previous directory, assuming none", "error", err)
 			}
@@ -98,43 +99,76 @@ var rootCmd = &cobra.Command{
 
 		added, removed := compareDirectories(prevFiles, currentFiles)
 
-		var changelog string
+		var filesToDownload []string
+		changesFile := ""
 		for _, e := range currentFiles.Entries {
 			if strings.HasSuffix(e.Name, ".changes") {
-				b, err := downloadFile(creds, project, pkg, e.Name, revision)
-				if err != nil {
-					slog.Warn("failed to download changes file", "file", e.Name, "error", err)
-				} else {
-					changelog = extractLatestChangelog(string(b))
-				}
+				changesFile = e.Name
+				filesToDownload = append(filesToDownload, e.Name)
 				break
 			}
 		}
+		if changesFile == "" {
+			return fmt.Errorf("Couldn't find a valid changes file")
+		}
+
+		// Identify the best matching .spec file
+		specFiles := []string{}
+		for _, e := range currentFiles.Entries {
+			if strings.HasSuffix(e.Name, ".spec") {
+				specFiles = append(specFiles, e.Name)
+			}
+		}
+		bestSpec := ""
+		if len(specFiles) > 1 {
+			bestSpec, _ = edlib.FuzzySearch(target.Package, specFiles, edlib.Levenshtein)
+		} else if len(specFiles) == 1 {
+			bestSpec = specFiles[0]
+		}
+		if bestSpec != "" {
+			filesToDownload = append(filesToDownload, bestSpec)
+		}
 
 		extracted := make(map[string]string)
-		for _, filename := range config.Files {
-			exists := false
-			for _, e := range currentFiles.Entries {
-				if e.Name == filename {
-					exists = true
-					break
+		var changelog string
+		var matchedSource string
+		var specSource SourceFile
+
+		if len(filesToDownload) > 0 {
+			downloadedBytes, err := downloadFiles(creds, target, filesToDownload)
+			if err != nil {
+				slog.Warn("failed to download some files", "error", err)
+			}
+
+			if b, ok := downloadedBytes[changesFile]; ok {
+				changelog = extractLatestChangelog(string(b))
+			}
+
+			if bestSpec != "" {
+				if b, ok := downloadedBytes[bestSpec]; ok {
+					// extracted[bestSpec] = string(b)
+					specSource = extractSourceFromSpec(string(b))
+					if specSource.Name != "" {
+						for _, e := range currentFiles.Entries {
+							if e.Name == specSource.Name {
+								matchedSource = e.Name
+								break
+							}
+						}
+					}
 				}
 			}
-			if exists {
-				b, err := downloadFile(creds, project, pkg, filename, revision)
-				if err != nil {
-					slog.Warn("failed to download file", "file", filename, "error", err)
-				} else {
-					extracted[filename] = string(b)
-				}
-			}
+
 		}
 
 		out := Output{
+			Name:           target.Package,
+			Version:        specSource.Version,
 			Changelog:      changelog,
 			AddedFiles:     added,
 			RemovedFiles:   removed,
 			ExtractedFiles: extracted,
+			Source:         matchedSource,
 		}
 
 		if out.AddedFiles == nil {
@@ -179,8 +213,8 @@ func init() {
 	viper.BindPFlag("output", rootCmd.Flags().Lookup("output"))
 }
 
-func getPreviousRevision(creds *osc.OSCCredentials, project, pkg, currentRev string) (string, error) {
-	url := fmt.Sprintf("%s/source/%s/%s/_history", creds.GetAPiAddr(), project, pkg)
+func getPreviousRevision(creds *osc.OSCCredentials, target PackageTarget) (string, error) {
+	url := fmt.Sprintf("%s/source/%s/%s/_history", creds.GetAPiAddr(), target.Project, target.Package)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
@@ -204,16 +238,16 @@ func getPreviousRevision(creds *osc.OSCCredentials, project, pkg, currentRev str
 
 	prev := ""
 	for _, r := range list.Revisions {
-		if r.Rev == currentRev {
+		if r.Rev == target.Revision {
 			return prev, nil
 		}
 		prev = r.Rev
 	}
-	return "", fmt.Errorf("revision %s not found in history", currentRev)
+	return "", fmt.Errorf("revision %s not found in history", target.Revision)
 }
 
-func getDirectory(creds *osc.OSCCredentials, project, pkg, revision string) (*Directory, error) {
-	url := fmt.Sprintf("%s/source/%s/%s?rev=%s", creds.GetAPiAddr(), project, pkg, revision)
+func getDirectory(creds *osc.OSCCredentials, target PackageTarget) (*Directory, error) {
+	url := fmt.Sprintf("%s/source/%s/%s?rev=%s", creds.GetAPiAddr(), target.Project, target.Package, target.Revision)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -266,25 +300,34 @@ func compareDirectories(prev, curr *Directory) (added []string, removed []string
 	return added, removed
 }
 
-func downloadFile(creds *osc.OSCCredentials, project, pkg, filename, revision string) ([]byte, error) {
-	url := fmt.Sprintf("%s/source/%s/%s/%s?rev=%s", creds.GetAPiAddr(), project, pkg, filename, revision)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.SetBasicAuth(creds.Name, creds.Passwd)
+func downloadFiles(creds *osc.OSCCredentials, target PackageTarget, filenames []string) (map[string][]byte, error) {
+	result := make(map[string][]byte)
+	for _, filename := range filenames {
+		url := fmt.Sprintf("%s/source/%s/%s/%s?rev=%s", creds.GetAPiAddr(), target.Project, target.Package, filename, target.Revision)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.SetBasicAuth(creds.Name, creds.Passwd)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to download file: %s", resp.Status)
-	}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("failed to download file %s: %s", filename, resp.Status)
+		}
 
-	return io.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read body for file %s: %w", filename, err)
+		}
+		result[filename] = b
+	}
+	return result, nil
 }
 
 func extractLatestChangelog(content string) string {
@@ -304,4 +347,52 @@ func extractLatestChangelog(content string) string {
 		}
 	}
 	return ""
+}
+
+type SourceFile struct {
+	Name    string
+	Version string
+}
+
+func extractSourceFromSpec(specContent string) SourceFile {
+	var name, version, source string
+	lines := strings.Split(specContent, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		lowerLine := strings.ToLower(line)
+		if strings.HasPrefix(lowerLine, "name:") && name == "" {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				name = strings.TrimSpace(parts[1])
+			}
+		} else if strings.HasPrefix(lowerLine, "version:") && version == "" {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				version = strings.TrimSpace(parts[1])
+			}
+		} else if (strings.HasPrefix(lowerLine, "source:") || strings.HasPrefix(lowerLine, "source0:")) && source == "" {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				source = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+
+	if source != "" {
+		if idx := strings.LastIndex(source, "/"); idx != -1 {
+			source = source[idx+1:]
+		}
+		if name != "" {
+			source = strings.ReplaceAll(source, "%{name}", name)
+			source = strings.ReplaceAll(source, "%name", name)
+		}
+		if version != "" {
+			source = strings.ReplaceAll(source, "%{version}", version)
+			source = strings.ReplaceAll(source, "%version", version)
+		}
+	}
+	return SourceFile{
+		Name:    source,
+		Version: version,
+	}
 }
