@@ -29,7 +29,8 @@ type Output struct {
 	Changelog      string            `json:"changelog"`
 	AddedFiles     []string          `json:"added_files"`
 	RemovedFiles   []string          `json:"removed_files"`
-	ExtractedFiles map[string]string `json:"extracted_files"`
+	ExtractedFiles map[string]string `json:"extracted_files,omitempty"`
+	Source         string            `json:"source"`
 }
 
 type RevisionList struct {
@@ -104,7 +105,7 @@ var rootCmd = &cobra.Command{
 				if err != nil {
 					slog.Warn("failed to download changes file", "file", e.Name, "error", err)
 				} else {
-					changelog = string(b)
+					changelog = extractLatestChangelog(string(b))
 				}
 				break
 			}
@@ -284,4 +285,23 @@ func downloadFile(creds *osc.OSCCredentials, project, pkg, filename, revision st
 	}
 
 	return io.ReadAll(resp.Body)
+}
+
+func extractLatestChangelog(content string) string {
+	marker := "-------------------------------------------------------------------"
+	parts := strings.Split(content, marker)
+
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+
+		// The first line of a non-empty part is the email/date line.
+		lines := strings.SplitN(trimmed, "\n", 2)
+		if len(lines) > 1 {
+			return strings.TrimSpace(lines[1])
+		}
+	}
+	return ""
 }
