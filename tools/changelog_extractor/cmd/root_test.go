@@ -94,8 +94,61 @@ Source: http://example.com/downloads/source-file.zip`,
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := extractSourceFromSpec(tt.specContent); got != tt.want {
+			if got := extractSourceFromSpec(tt.specContent).Name; got != tt.want {
 				t.Errorf("extractSourceFromSpec() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFindSourceMatch(t *testing.T) {
+	tests := []struct {
+		name           string
+		specSourceName string
+		entries        []Entry
+		want           string
+	}{
+		{
+			name:           "exact match",
+			specSourceName: "foo-1.0.tar.gz",
+			entries: []Entry{
+				{Name: "foo-1.0.tar.gz"},
+				{Name: "foo.spec"},
+			},
+			want: "foo-1.0.tar.gz",
+		},
+		{
+			name:           "obscpio match",
+			specSourceName: "foo-1.0.tar.gz",
+			entries: []Entry{
+				{Name: "foo-1.0.tar.gz.obscpio"},
+				{Name: "foo.spec"},
+			},
+			want: "foo-1.0.tar.gz.obscpio",
+		},
+		{
+			name:           "no match",
+			specSourceName: "foo-1.0.tar.gz",
+			entries: []Entry{
+				{Name: "bar-1.0.tar.gz"},
+				{Name: "foo.spec"},
+			},
+			want: "",
+		},
+		{
+			name:           "empty spec source",
+			specSourceName: "",
+			entries: []Entry{
+				{Name: "foo-1.0.tar.gz"},
+			},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := findSourceMatch(tt.specSourceName, tt.entries); got != tt.want {
+				t.Errorf("findSourceMatch() = %q, want %q", got, tt.want)
 			}
 		})
 	}

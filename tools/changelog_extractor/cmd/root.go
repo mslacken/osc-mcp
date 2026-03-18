@@ -149,12 +149,7 @@ var rootCmd = &cobra.Command{
 					// extracted[bestSpec] = string(b)
 					specSource = extractSourceFromSpec(string(b))
 					if specSource.Name != "" {
-						for _, e := range currentFiles.Entries {
-							if e.Name == specSource.Name {
-								matchedSource = e.Name
-								break
-							}
-						}
+						matchedSource = findSourceMatch(specSource.Name, currentFiles.Entries)
 					}
 				}
 			}
@@ -396,3 +391,34 @@ func extractSourceFromSpec(specContent string) SourceFile {
 		Version: version,
 	}
 }
+
+func findSourceMatch(specSourceName string, entries []Entry) string {
+	if specSourceName == "" {
+		return ""
+	}
+
+	for _, e := range entries {
+		if e.Name == specSourceName {
+			return specSourceName
+		}
+	}
+
+	// Try matching without extension for .obscpio files
+	specBase := specSourceName
+	extensions := []string{".tar.gz", ".tar.xz", ".tar.bz2", ".tar", ".zip", ".tgz"}
+	for _, ext := range extensions {
+		if strings.HasSuffix(specSourceName, ext) {
+			specBase = strings.TrimSuffix(specSourceName, ext)
+			break
+		}
+	}
+
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name, ".obscpio") && strings.TrimSuffix(e.Name, ".obscpio") == specBase {
+			return e.Name
+		}
+	}
+
+	return ""
+}
+
