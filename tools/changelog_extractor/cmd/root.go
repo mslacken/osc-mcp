@@ -1,6 +1,12 @@
 package cmd
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bufio"
+	"bytes"
+	"compress/bzip2"
+	"compress/gzip"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -10,15 +16,18 @@ import (
 	"os"
 	"strings"
 
+	"github.com/cavaliergopher/cpio"
 	"github.com/hbollon/go-edlib"
 	"github.com/openSUSE/osc-mcp/internal/pkg/osc"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/ulikunitz/xz"
 )
 
 var (
-	cfgFile    string
-	outputFile string
+	cfgFile string
+	nLines  int
+	debug   bool
 )
 
 // type Config struct {
@@ -26,13 +35,14 @@ var (
 // }
 
 type Output struct {
-	Name           string            `json:"name"`
-	Version        string            `json:"version"`
-	Changelog      string            `json:"changelog"`
-	AddedFiles     []string          `json:"added_files"`
-	RemovedFiles   []string          `json:"removed_files"`
-	ExtractedFiles map[string]string `json:"extracted_files,omitempty"`
-	Source         string            `json:"source"`
+	Name             string            `json:"name"`
+	Version          string            `json:"version"`
+	Changelog        string            `json:"changelog"`
+	ArchiveChangelog string            `json:"archive_changelog,omitempty"`
+	AddedFiles       []string          `json:"added_files"`
+	RemovedFiles     []string          `json:"removed_files"`
+	ExtractedFiles   map[string]string `json:"extracted_files,omitempty"`
+	Source           string            `json:"source"`
 }
 
 type RevisionList struct {
@@ -64,6 +74,16 @@ var rootCmd = &cobra.Command{
 	Use:   "changelog_extractor [project] [package] [revision]",
 	Short: "Extract changelog, added/removed files, and specified files from OBS",
 	Args:  cobra.ExactArgs(3),
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		logLevel := slog.LevelInfo
+		if debug {
+			logLevel = slog.LevelDebug
+		}
+		handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+			Level: logLevel,
+		})
+		slog.SetDefault(slog.New(handler))
+	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		target := PackageTarget{
 			Project:  args[0],
@@ -133,11 +153,12 @@ var rootCmd = &cobra.Command{
 		var changelog string
 		var matchedSource string
 		var specSource SourceFile
+		var archiveChangelog string
 
 		if len(filesToDownload) > 0 {
 			downloadedBytes, err := downloadFiles(creds, target, filesToDownload)
 			if err != nil {
-				slog.Warn("failed to download some files", "error", err)
+				slog.Warn("failed to download initial files", "error", err)
 			}
 
 			if b, ok := downloadedBytes[changesFile]; ok {
@@ -146,24 +167,51 @@ var rootCmd = &cobra.Command{
 
 			if bestSpec != "" {
 				if b, ok := downloadedBytes[bestSpec]; ok {
-					// extracted[bestSpec] = string(b)
 					specSource = extractSourceFromSpec(string(b))
 					if specSource.Name != "" {
-						matchedSource = findSourceMatch(specSource.Name, currentFiles.Entries)
+						if matchedSourceFile, versionChanged := findSourceMatch(specSource, currentFiles.Entries); versionChanged {
+							specSource.Version = matchedSourceFile.Version
+							matchedSource = matchedSourceFile.Name
+						} else {
+							matchedSource = matchedSourceFile.Name
+						}
 					}
 				}
 			}
 
+			// If we found a source that wasn't in our initial download list, download it now
+			if matchedSource != "" {
+				if _, ok := downloadedBytes[matchedSource]; !ok {
+					sourceBytes, err := downloadFiles(creds, target, []string{matchedSource})
+					if err != nil {
+						slog.Warn("failed to download source archive", "error", err)
+					} else {
+						if b, ok := sourceBytes[matchedSource]; ok {
+							downloadedBytes[matchedSource] = b
+						}
+					}
+				}
+			}
+
+			if matchedSource != "" {
+				if b, ok := downloadedBytes[matchedSource]; ok {
+					archiveChangelog, err = extractChangelogFromArchive(b, matchedSource, nLines)
+					if err != nil {
+						slog.Warn("failed to extract changelog from archive", "error", err)
+					}
+				}
+			}
 		}
 
 		out := Output{
-			Name:           target.Package,
-			Version:        specSource.Version,
-			Changelog:      changelog,
-			AddedFiles:     added,
-			RemovedFiles:   removed,
-			ExtractedFiles: extracted,
-			Source:         matchedSource,
+			Name:             target.Package,
+			Version:          specSource.Version,
+			Changelog:        changelog,
+			ArchiveChangelog: archiveChangelog,
+			AddedFiles:       added,
+			RemovedFiles:     removed,
+			ExtractedFiles:   extracted,
+			Source:           matchedSource,
 		}
 
 		if out.AddedFiles == nil {
@@ -181,14 +229,7 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("failed to marshal output JSON: %w", err)
 		}
 
-		if outputFile != "" {
-			if err := os.WriteFile(outputFile, outBytes, 0644); err != nil {
-				return fmt.Errorf("failed to write output file: %w", err)
-			}
-			fmt.Printf("Output written to %s\n", outputFile)
-		} else {
-			fmt.Println(string(outBytes))
-		}
+		fmt.Println(string(outBytes))
 
 		return nil
 	},
@@ -203,9 +244,136 @@ func Execute() {
 
 func init() {
 	rootCmd.Flags().StringVarP(&cfgFile, "config", "c", "", "YAML config file containing list of files to extract")
-	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "output.json", "Output JSON file")
+	rootCmd.Flags().IntVarP(&nLines, "n-lines", "n", 20, "Number of lines to extract from internal changelog")
+	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
 	viper.BindPFlag("config", rootCmd.Flags().Lookup("config"))
-	viper.BindPFlag("output", rootCmd.Flags().Lookup("output"))
+	viper.BindPFlag("n_lines", rootCmd.Flags().Lookup("n-lines"))
+}
+
+func isChangelogFile(filename string) bool {
+	base := strings.ToLower(filename)
+	// Remove path if any
+	if idx := strings.LastIndex(base, "/"); idx != -1 {
+		base = base[idx+1:]
+	}
+
+	prefixes := []string{"changelog", "changlog", "changes", "news"}
+	for _, p := range prefixes {
+		if strings.HasPrefix(base, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractFirstNLines(r io.Reader, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	scanner := bufio.NewScanner(r)
+	var lines []string
+	for i := 0; i < n && scanner.Scan(); i++ {
+		lines = append(lines, scanner.Text())
+	}
+	return strings.Join(lines, "\n")
+}
+
+func extractChangelogFromArchive(archiveBytes []byte, filename string, n int) (string, error) {
+	slog.Debug("called extractChangelogFromArchive", "filename", filename, "size", len(archiveBytes))
+	if n <= 0 {
+		return "", nil
+	}
+
+	reader := bytes.NewReader(archiveBytes)
+
+	// Determine if we need to decompress
+	var r io.Reader = reader
+	var err error
+
+	// Handle common compressions
+	if strings.HasSuffix(filename, ".gz") || strings.HasSuffix(filename, ".tgz") {
+		slog.Debug("using gzip reader")
+		r, err = gzip.NewReader(r)
+		if err != nil {
+			return "", err
+		}
+	} else if strings.HasSuffix(filename, ".bz2") {
+		slog.Debug("using bzip2 reader")
+		r = bzip2.NewReader(r)
+	} else if strings.HasSuffix(filename, ".xz") {
+		slog.Debug("using xz reader")
+		r, err = xz.NewReader(r)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// Now handle archive format
+	if strings.Contains(filename, ".cpio") || strings.Contains(filename, ".obscpio") {
+		slog.Debug("using cpio archive reader")
+		cr := cpio.NewReader(r)
+		for {
+			header, err := cr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				slog.Debug("cpio reader error", "error", err)
+				return "", err
+			}
+			slog.Debug("cpio file", "name", header.Name)
+			if isChangelogFile(header.Name) && header.Mode.IsRegular() {
+				slog.Debug("found changelog match in cpio", "name", header.Name)
+				return extractFirstNLines(cr, n), nil
+			}
+		}
+	} else if strings.HasSuffix(filename, ".zip") {
+		slog.Debug("using zip archive reader")
+		// zip needs a ReaderAt, so we use the original bytes
+		zr, err := zip.NewReader(bytes.NewReader(archiveBytes), int64(len(archiveBytes)))
+		if err != nil {
+			return "", err
+		}
+		for _, f := range zr.File {
+			slog.Debug("zip file", "name", f.Name)
+			if isChangelogFile(f.Name) && !f.FileInfo().IsDir() {
+				slog.Debug("found changelog match in zip", "name", f.Name)
+				rc, err := f.Open()
+				if err != nil {
+					return "", err
+				}
+				content := extractFirstNLines(rc, n)
+				rc.Close()
+				return content, nil
+			}
+		}
+	} else if isChangelogFile(filename) {
+		slog.Debug("file is a standalone changelog file")
+		// If the downloaded source is a standalone changelog file
+		return extractFirstNLines(r, n), nil
+	} else {
+		slog.Debug("using fallback tar archive reader")
+		// Fallback: assume tar for .tar, .tgz, .tbz2, .txz, or generic .gz/.bz2/.xz tarballs
+		tr := tar.NewReader(r)
+		for {
+			header, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				// Not a valid tar file or unexpected error, just break
+				slog.Debug("tar reader error", "error", err)
+				break
+			}
+			if isChangelogFile(header.Name) && header.Typeflag == tar.TypeReg {
+				slog.Debug("found changelog match in tar", "name", header.Name)
+				return extractFirstNLines(tr, n), nil
+			}
+		}
+	}
+
+	slog.Debug("no changelog file found in archive")
+	return "", nil
 }
 
 func getPreviousRevision(creds *osc.OSCCredentials, target PackageTarget) (string, error) {
@@ -392,33 +560,73 @@ func extractSourceFromSpec(specContent string) SourceFile {
 	}
 }
 
-func findSourceMatch(specSourceName string, entries []Entry) string {
+func findSourceMatch(specSource SourceFile, entries []Entry) (SourceFile, bool) {
+	specSourceName := specSource.Name
 	if specSourceName == "" {
-		return ""
+		return SourceFile{}, false
 	}
 
+	var bestMatch string
+	// Exact match first
 	for _, e := range entries {
 		if e.Name == specSourceName {
-			return specSourceName
-		}
-	}
-
-	// Try matching without extension for .obscpio files
-	specBase := specSourceName
-	extensions := []string{".tar.gz", ".tar.xz", ".tar.bz2", ".tar", ".zip", ".tgz"}
-	for _, ext := range extensions {
-		if strings.HasSuffix(specSourceName, ext) {
-			specBase = strings.TrimSuffix(specSourceName, ext)
+			bestMatch = e.Name
 			break
 		}
 	}
 
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name, ".obscpio") && strings.TrimSuffix(e.Name, ".obscpio") == specBase {
-			return e.Name
+	if bestMatch == "" {
+		// Try matching against .obscpio files (where the base name matches)
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name, ".obscpio") && strings.TrimSuffix(e.Name, ".obscpio") == specSourceName {
+				bestMatch = e.Name
+				break
+			}
 		}
 	}
 
-	return ""
-}
+	if bestMatch == "" {
+		// Prepare list of entry names for fuzzy search
+		entryNames := make([]string, 0, len(entries))
+		for _, e := range entries {
+			// Skip .spec and .changes as they are unlikely to be the "source" archive we want
+			if strings.HasSuffix(e.Name, ".spec") || strings.HasSuffix(e.Name, ".changes") {
+				continue
+			}
+			entryNames = append(entryNames, e.Name)
+		}
 
+		if len(entryNames) > 0 {
+			// Use fuzzy search to find the best match, which helps when unexpanded macros are present
+			m, err := edlib.FuzzySearch(specSourceName, entryNames, edlib.Levenshtein)
+			if err == nil && m != "" {
+				bestMatch = m
+			}
+		}
+	}
+
+	res := SourceFile{
+		Name:    bestMatch,
+		Version: specSource.Version,
+	}
+	// Try to extract version if it's a macro
+	if strings.HasPrefix(specSource.Version, "%{") && strings.HasSuffix(specSource.Version, "}") {
+		macro := specSource.Version
+		tmpl := specSource.Name
+		if strings.Contains(tmpl, macro) {
+			parts := strings.SplitN(tmpl, macro, 2)
+			prefix := parts[0]
+			suffix := parts[1]
+
+			if strings.HasPrefix(bestMatch, prefix) && strings.HasSuffix(bestMatch, suffix) {
+				extractedVersion := bestMatch[len(prefix) : len(bestMatch)-len(suffix)]
+				if extractedVersion != "" {
+					res.Version = extractedVersion
+					return res, true
+				}
+			}
+		}
+	}
+
+	return res, false
+}

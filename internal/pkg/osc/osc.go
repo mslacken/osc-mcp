@@ -127,7 +127,7 @@ func GetCredentials() (OSCCredentials, error) {
 		}
 		creds.Name = user
 		creds.Passwd = pass
-		slog.Info("Loaded credentials from config file", "user", user, "api", creds.Apiaddr)
+		slog.Debug("Loaded credentials from config file", "user", user, "api", creds.Apiaddr)
 		return creds, nil
 	}
 
@@ -153,7 +153,7 @@ func GetCredentials() (OSCCredentials, error) {
 		return creds, fmt.Errorf("password found in keyring for %s, but username is missing from both keyring and config", creds.Apiaddr)
 	}
 
-	slog.Info("Loaded credentials from keyring", "user", creds.Name, "api", creds.Apiaddr)
+	slog.Debug("Loaded credentials from keyring", "user", creds.Name, "api", creds.Apiaddr)
 	return creds, nil
 }
 
