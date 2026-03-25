@@ -3,6 +3,7 @@ package cmd
 import (
 	"archive/tar"
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/cavaliergopher/cpio"
@@ -94,11 +95,23 @@ Version: 1
 Source: http://example.com/downloads/source-file.zip`,
 			want: "source-file.zip",
 		},
+		{
+			name: "source0 match",
+			specContent: `Name: mypkg
+Version: 1.0
+Source0: mypkg-1.0.tar.gz`,
+			want: "mypkg-1.0.tar.gz",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := extractSourceFromSpec(tt.specContent).Name; got != tt.want {
+			values := extractSourceFromSpec(tt.specContent, []string{"Name", "Version", "Source"})
+			got := expandMacros(values["Source"], values["Name"], values["Version"])
+			if idx := strings.LastIndex(got, "/"); idx != -1 {
+				got = got[idx+1:]
+			}
+			if got != tt.want {
 				t.Errorf("extractSourceFromSpec() = %q, want %q", got, tt.want)
 			}
 		})

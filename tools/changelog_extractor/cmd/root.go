@@ -39,10 +39,11 @@ type Output struct {
 	Version          string            `json:"version"`
 	Changelog        string            `json:"changelog"`
 	ArchiveChangelog string            `json:"archive_changelog,omitempty"`
-	AddedFiles       []string          `json:"added_files"`
-	RemovedFiles     []string          `json:"removed_files"`
+	AddedFiles       []string          `json:"added_files,omitempty"`
+	RemovedFiles     []string          `json:"removed_files,omitempty"`
 	ExtractedFiles   map[string]string `json:"extracted_files,omitempty"`
 	Source           string            `json:"source"`
+	GitHubRelease    string            `json:"github_release_notes,omitempty"`
 }
 
 type RevisionList struct {
@@ -154,6 +155,9 @@ var rootCmd = &cobra.Command{
 		var matchedSource string
 		var specSource SourceFile
 		var archiveChangelog string
+		var specURL string
+		var githubOwner, githubRepo string
+		var githubReleaseNotes string
 
 		if len(filesToDownload) > 0 {
 			downloadedBytes, err := downloadFiles(creds, target, filesToDownload)
@@ -167,8 +171,28 @@ var rootCmd = &cobra.Command{
 
 			if bestSpec != "" {
 				if b, ok := downloadedBytes[bestSpec]; ok {
-					specSource = extractSourceFromSpec(string(b))
+					specValues := extractSourceFromSpec(string(b), []string{"Name", "Version", "Source", "URL"})
+					specSource.Version = specValues["Version"]
+					specSource.Name = specValues["Source"]
+					specURL = specValues["URL"]
+					rawSource := specValues["Source"]
+					name := specValues["Name"]
+
+					specURL = expandMacros(specURL, name, specSource.Version)
+					rawSource = expandMacros(rawSource, name, specSource.Version)
+
+					// Try to extract github repo from URL, then fallback to Source
+					githubOwner, githubRepo = parseGitHubOwnerRepo(specURL)
+					if githubOwner == "" || githubRepo == "" {
+						githubOwner, githubRepo = parseGitHubOwnerRepo(rawSource)
+					}
+
 					if specSource.Name != "" {
+						specSource.Name = expandMacros(specSource.Name, name, specSource.Version)
+						if idx := strings.LastIndex(specSource.Name, "/"); idx != -1 {
+							specSource.Name = specSource.Name[idx+1:]
+						}
+
 						if matchedSourceFile, versionChanged := findSourceMatch(specSource, currentFiles.Entries); versionChanged {
 							specSource.Version = matchedSourceFile.Version
 							matchedSource = matchedSourceFile.Name
@@ -203,6 +227,13 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
+		if githubOwner != "" && githubRepo != "" {
+			githubReleaseNotes = fetchGitHubReleaseNotes(githubOwner, githubRepo, specSource.Version)
+			if githubReleaseNotes != "" {
+				githubReleaseNotes = extractFirstNLines(strings.NewReader(githubReleaseNotes), nLines)
+			}
+		}
+
 		out := Output{
 			Name:             target.Package,
 			Version:          specSource.Version,
@@ -212,6 +243,7 @@ var rootCmd = &cobra.Command{
 			RemovedFiles:     removed,
 			ExtractedFiles:   extracted,
 			Source:           matchedSource,
+			GitHubRelease:    githubReleaseNotes,
 		}
 
 		if out.AddedFiles == nil {
@@ -517,47 +549,44 @@ type SourceFile struct {
 	Version string
 }
 
-func extractSourceFromSpec(specContent string) SourceFile {
-	var name, version, source string
+func extractSourceFromSpec(specContent string, keys []string) map[string]string {
+	values := make(map[string]string)
 	lines := strings.Split(specContent, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		lowerLine := strings.ToLower(line)
-		if strings.HasPrefix(lowerLine, "name:") && name == "" {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				name = strings.TrimSpace(parts[1])
-			}
-		} else if strings.HasPrefix(lowerLine, "version:") && version == "" {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				version = strings.TrimSpace(parts[1])
-			}
-		} else if (strings.HasPrefix(lowerLine, "source:") || strings.HasPrefix(lowerLine, "source0:")) && source == "" {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				source = strings.TrimSpace(parts[1])
-			}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
 		}
-	}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		lowerKey := strings.ToLower(key)
 
-	if source != "" {
-		if idx := strings.LastIndex(source, "/"); idx != -1 {
-			source = source[idx+1:]
-		}
-		if name != "" {
-			source = strings.ReplaceAll(source, "%{name}", name)
-			source = strings.ReplaceAll(source, "%name", name)
-		}
-		if version != "" {
-			source = strings.ReplaceAll(source, "%{version}", version)
-			source = strings.ReplaceAll(source, "%version", version)
+		for _, k := range keys {
+			lowerK := strings.ToLower(k)
+			if lowerKey == lowerK || lowerKey == lowerK+"0" {
+				if _, exists := values[k]; !exists {
+					values[k] = val
+				}
+			}
 		}
 	}
-	return SourceFile{
-		Name:    source,
-		Version: version,
+	return values
+}
+
+func expandMacros(source, name, version string) string {
+	if source == "" {
+		return ""
 	}
+	if name != "" {
+		source = strings.ReplaceAll(source, "%{name}", name)
+		source = strings.ReplaceAll(source, "%name", name)
+	}
+	if version != "" {
+		source = strings.ReplaceAll(source, "%{version}", version)
+		source = strings.ReplaceAll(source, "%version", version)
+	}
+	return source
 }
 
 func findSourceMatch(specSource SourceFile, entries []Entry) (SourceFile, bool) {
