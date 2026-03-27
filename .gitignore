@@ -2,6 +2,7 @@
 osc-mcp
 parse_log
 write-report
+bin/*
 # ignore the vendored stuff
 vendor/*
 tools/changelog_extractor/changelog_extractor

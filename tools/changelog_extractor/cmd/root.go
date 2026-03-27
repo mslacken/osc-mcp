@@ -38,12 +38,12 @@ type Output struct {
 	Name             string            `json:"name"`
 	Version          string            `json:"version"`
 	Changelog        string            `json:"changelog"`
-	ArchiveChangelog string            `json:"archive_changelog,omitempty"`
-	AddedFiles       []string          `json:"added_files,omitempty"`
-	RemovedFiles     []string          `json:"removed_files,omitempty"`
-	ExtractedFiles   map[string]string `json:"extracted_files,omitempty"`
+	ArchiveChangelog string            `json:"archive_changelog"`
+	AddedFiles       []string          `json:"added_files"`
+	RemovedFiles     []string          `json:"removed_files"`
+	ExtractedFiles   map[string]string `json:"extracted_files"`
 	Source           string            `json:"source"`
-	GitHubRelease    string            `json:"github_release_notes,omitempty"`
+	GitHubRelease    string            `json:"github_release_notes"`
 }
 
 type RevisionList struct {
