@@ -58,19 +58,148 @@ def append_to_json_list(file_path: str, data: dict):
         json.dump(existing_data, f, indent=2)
     os.replace(temp_path, file_path)
 
+def clean_obs_diff(diff_text: str) -> str:
+    """Removes the OBS limiter line and the subsequent author/date line from diffs."""
+    if not diff_text:
+        return ""
+    
+    marker = "-------------------------------------------------------------------"
+    lines = diff_text.splitlines()
+    new_lines = []
+    skip_next = False
+    
+    for line in lines:
+        if marker in line:
+            skip_next = True
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        new_lines.append(line)
+    
+    return "\n".join(new_lines).strip()
+
+def process_request(req_id: int, req_getter: str, changelog_ext: str, output_file: str) -> bool:
+    """Processes a single request ID. Returns True if successful and data was appended."""
+    # 1. Check if request is accepted to Factory and get source details
+    cmd = [req_getter, str(req_id), "-f", "state=accepted", "-f", "target=openSUSE:Factory"]
+    
+    output = run_command(cmd)
+    
+    if not output:
+        print("Skipped (no output from request_getter).")
+        return False
+
+    try:
+        data = json.loads(output)
+        if "error" in data:
+            print("Skipped (not accepted to Factory or failed).")
+            return False
+
+        # Extract fields from the first action
+        actions = data.get("Actions", []) or data.get("action", [])
+        if not actions:
+            print("Skipped (no actions found in request).")
+            return False
+        
+        action = actions[0]
+        project = action.get("Source", {}).get("Project") or action.get("source", {}).get("project")
+        package = action.get("Source", {}).get("Package") or action.get("source", {}).get("package")
+        revision = action.get("Source", {}).get("Rev") or action.get("source", {}).get("rev")
+
+        if project and package and revision:
+            # Extract more from sourcediff
+            changed_files = []
+            removed_files = []
+            spec_diff = ""
+            changes_diff = ""
+
+            sourcediff = action.get("SourceDiff", {}) or action.get("sourcediff", {})
+            if sourcediff:
+                diff_files = sourcediff.get("Files", []) or sourcediff.get("files", [])
+                for df in diff_files:
+                    new_file = df.get("New", {}) or df.get("new", {})
+                    old_file = df.get("Old", {}) or df.get("old", {})
+                    name = new_file.get("Name") or new_file.get("name")
+                    old_name = old_file.get("Name") or old_file.get("name")
+                    diff_data = df.get("Diff", {}).get("Data") or df.get("diff", {}).get("data", "")
+
+                    if name:
+                        top_level = name.split('/')[0]
+                        if top_level not in changed_files:
+                            changed_files.append(top_level)
+                        
+                        if '/' in name:
+                            continue
+                        
+                        if name.endswith(".spec"):
+                            spec_diff = diff_data
+                        elif name.endswith(".changes"):
+                            changes_diff = diff_data
+                    elif old_name:
+                        top_level = old_name.split('/')[0]
+                        if top_level not in removed_files:
+                            removed_files.append(top_level)
+
+            print(f"Found! Fetching changelog for {project}/{package}@{revision}...", end=" ", flush=True)
+
+            # 2. Extract changelog data
+            fields_ext = "source,archive_changelog,url,github_release_notes"
+            cmd_ext = [changelog_ext, project, package, revision, "-F", fields_ext]
+            ext_output = run_command(cmd_ext)
+
+            if ext_output:
+                try:
+                    data_ext = json.loads(ext_output)
+                    # Combine data
+                    final_data = {
+                        "request_id": req_id,
+                        "project": project,
+                        "package": package,
+                        "revision": revision,
+                        "changed_files": changed_files,
+                        "removed_files": removed_files,
+                        "spec_diff": clean_obs_diff(spec_diff),
+                        "changes_diff": clean_obs_diff(changes_diff),
+                        "source_file": data_ext.get("source"),
+                        "archive_changelog": data_ext.get("archive_changelog"),
+                        "url": data_ext.get("url"),
+                        "github_release_notes": data_ext.get("github_release_notes")
+                    }
+                    append_to_json_list(output_file, final_data)
+                    print("Done.")
+                    return True
+
+                except json.JSONDecodeError:
+                    print("Error parsing changelog extractor output.")
+            else:
+                print("Failed to extract changelog.")
+        else:
+            print(f"Missing required fields in request_getter output for {req_id}")
+    except json.JSONDecodeError:
+        print(f"Unexpected non-JSON output from request_getter for {req_id}: {output}")
+    except Exception as e:
+        import traceback
+        print(f"Error processing output for {req_id}: {e}")
+    return False
+
 def main():
     parser = argparse.ArgumentParser(description="Collect data from OBS requests.")
-    parser.add_argument("n0", type=int, help="Lower bound of request IDs")
-    parser.add_argument("n1", type=int, help="Upper bound of request IDs")
+    parser.add_argument("n0", type=int, nargs='?', help="Lower bound of request IDs (optional if --request is used)")
+    parser.add_argument("n1", type=int, nargs='?', help="Upper bound of request IDs (optional if --request is used)")
+    parser.add_argument("--request", "-r", type=int, help="Process just this single request ID")
     parser.add_argument("--rate-limit", type=float, default=1.0, help="Seconds between requests")
     parser.add_argument("--bypass", action="store_true", help="Only generate random numbers and exit")
     parser.add_argument("--sigma", type=float, help="Sigma for Gaussian distribution (default: (n1-n0)/2)")
-    parser.add_argument("--output", default="data/changes.json", help="Output JSON file")
+    parser.add_argument("--output", default="changes.json", help="Output JSON file")
     parser.add_argument("--count", type=int, default=10, help="Number of requests to try")
 
     args = parser.parse_args()
 
     if args.bypass:
+        if args.n0 is None or args.n1 is None:
+            print("Error: n0 and n1 are required for --bypass")
+            sys.exit(1)
         print(f"Generating {args.count} random numbers in range [{args.n0}, {args.n1}] (max at {args.n1}):")
         for _ in range(args.count):
             print(get_truncated_gauss(args.n0, args.n1, args.sigma))
@@ -89,7 +218,18 @@ def main():
         print("Please run 'make tools' to build them.")
         sys.exit(1)
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    if args.request:
+        print(f"Checking single request {args.request}...", end=" ", flush=True)
+        process_request(args.request, req_getter, changelog_ext, args.output)
+        return
+
+    if args.n0 is None or args.n1 is None:
+        print("Error: Either provide n0 and n1 for random collection, or use --request for a single ID.")
+        sys.exit(1)
 
     success_count = 0
     attempts = 0
@@ -99,55 +239,8 @@ def main():
         attempts += 1
         print(f"Attempt {attempts}: Checking request {req_id}...", end=" ", flush=True)
 
-        # 1. Check if request is accepted to Factory and get source details
-        # -F returns "source.project package revision"
-        fields = "source.project,package,revision"
-        cmd = [req_getter, str(req_id), "-f", "state=accepted", "-f", "target=openSUSE:Factory", "-F", fields]
-        
-        output = run_command(cmd)
-        
-        if not output:
-            print("Skipped (no output from request_getter).")
-        else:
-            try:
-                data = json.loads(output)
-                if "error" in data:
-                    print("Skipped (not accepted to Factory or failed).")
-                else:
-                    # Extract fields from JSON map (they are arrays of strings)
-                    project_list = data.get("source.project", [])
-                    package_list = data.get("package", [])
-                    revision_list = data.get("revision", [])
-
-                    if project_list and package_list and revision_list:
-                        # Take first element if multiple actions exist
-                        project = project_list[0]
-                        package = package_list[0]
-                        revision = revision_list[0]
-
-                        print(f"Found! Fetching changelog for {project}/{package}@{revision}...", end=" ", flush=True)
-                        
-                        # 2. Extract changelog data
-                        cmd_ext = [changelog_ext, project, package, revision]
-                        ext_output = run_command(cmd_ext)
-                        
-                        if ext_output:
-                            try:
-                                data_ext = json.loads(ext_output)
-                                data_ext["request_id"] = req_id
-                                append_to_json_list(args.output, data_ext)
-                                print("Done.")
-                                success_count += 1
-                            except json.JSONDecodeError:
-                                print("Error parsing changelog extractor output.")
-                        else:
-                            print("Failed to extract changelog.")
-                    else:
-                        print(f"Missing required fields in request_getter output: {output}")
-            except json.JSONDecodeError:
-                print(f"Unexpected non-JSON output from request_getter: {output}")
-            except Exception as e:
-                print(f"Error processing output: {e}")
+        if process_request(req_id, req_getter, changelog_ext, args.output):
+            success_count += 1
 
         if success_count < args.count:
             time.sleep(args.rate_limit)

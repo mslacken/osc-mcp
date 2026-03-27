@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/cavaliergopher/cpio"
@@ -29,6 +30,8 @@ var (
 	cfgFile string
 	nLines  int
 	debug   bool
+	filters []string
+	fields  []string
 )
 
 // type Config struct {
@@ -46,6 +49,7 @@ type Output struct {
 	Source           string            `json:"source"`
 	GitHubRelease    string            `json:"github_release_notes"`
 	SpecDiff         string            `json:"spec_diff"`
+	URL              string            `json:"url"`
 }
 
 type RevisionList struct {
@@ -101,9 +105,18 @@ var rootCmd = &cobra.Command{
 		}
 		creds := &credsVal
 
-		prevRevision, err := getPreviousRevision(creds, target)
-		if err != nil {
-			slog.Warn("could not determine previous revision, assuming none", "error", err)
+		needPrev := isFieldNeeded("AddedFiles") || isFieldNeeded("RemovedFiles") || isFieldNeeded("SpecDiff")
+		needCurrentSpec := isFieldNeeded("Version") || isFieldNeeded("Source") || isFieldNeeded("GitHubRelease") || isFieldNeeded("SpecDiff") || isFieldNeeded("URL")
+		needCurrentChanges := isFieldNeeded("Changelog")
+		needSourceArchive := isFieldNeeded("ArchiveChangelog")
+		needGitHub := isFieldNeeded("GitHubRelease")
+
+		var prevRevision string
+		if needPrev {
+			prevRevision, err = getPreviousRevision(creds, target)
+			if err != nil {
+				slog.Warn("could not determine previous revision, assuming none", "error", err)
+			}
 		}
 
 		currentFiles, err := getDirectory(creds, target)
@@ -124,36 +137,40 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		added, removed := compareDirectories(prevFiles, currentFiles)
+		var added, removed []string
+		if needPrev {
+			added, removed = compareDirectories(prevFiles, currentFiles)
+		}
 
 		var filesToDownload []string
 		changesFile := ""
-		for _, e := range currentFiles.Entries {
-			if strings.HasSuffix(e.Name, ".changes") {
-				changesFile = e.Name
-				filesToDownload = append(filesToDownload, e.Name)
-				break
+		if needCurrentChanges {
+			for _, e := range currentFiles.Entries {
+				if strings.HasSuffix(e.Name, ".changes") {
+					changesFile = e.Name
+					filesToDownload = append(filesToDownload, e.Name)
+					break
+				}
 			}
-		}
-		if changesFile == "" {
-			return fmt.Errorf("Couldn't find a valid changes file")
 		}
 
 		// Identify the best matching .spec file
-		specFiles := []string{}
-		for _, e := range currentFiles.Entries {
-			if strings.HasSuffix(e.Name, ".spec") {
-				specFiles = append(specFiles, e.Name)
-			}
-		}
 		bestSpec := ""
-		if len(specFiles) > 1 {
-			bestSpec, _ = edlib.FuzzySearch(target.Package, specFiles, edlib.Levenshtein)
-		} else if len(specFiles) == 1 {
-			bestSpec = specFiles[0]
-		}
-		if bestSpec != "" {
-			filesToDownload = append(filesToDownload, bestSpec)
+		if needCurrentSpec {
+			specFiles := []string{}
+			for _, e := range currentFiles.Entries {
+				if strings.HasSuffix(e.Name, ".spec") {
+					specFiles = append(specFiles, e.Name)
+				}
+			}
+			if len(specFiles) > 1 {
+				bestSpec, _ = edlib.FuzzySearch(target.Package, specFiles, edlib.Levenshtein)
+			} else if len(specFiles) == 1 {
+				bestSpec = specFiles[0]
+			}
+			if bestSpec != "" {
+				filesToDownload = append(filesToDownload, bestSpec)
+			}
 		}
 
 		extracted := make(map[string]string)
@@ -172,13 +189,15 @@ var rootCmd = &cobra.Command{
 				slog.Warn("failed to download initial files", "error", err)
 			}
 
-			if b, ok := downloadedBytes[changesFile]; ok {
-				changelog = extractLatestChangelog(string(b))
+			if changesFile != "" {
+				if b, ok := downloadedBytes[changesFile]; ok {
+					changelog = extractLatestChangelog(string(b))
+				}
 			}
 
 			if bestSpec != "" {
 				if b, ok := downloadedBytes[bestSpec]; ok {
-					if prevTargetValid && prevFiles != nil {
+					if isFieldNeeded("SpecDiff") && prevTargetValid && prevFiles != nil {
 						hasPrevSpec := false
 						for _, e := range prevFiles.Entries {
 							if e.Name == bestSpec {
@@ -198,17 +217,7 @@ var rootCmd = &cobra.Command{
 										Context:  3,
 									}
 									specDiff, _ = difflib.GetUnifiedDiffString(diff)
-									if specDiff == "" {
-										slog.Debug("SpecDiff is empty, but files were downloaded", "len_pb", len(pb), "len_b", len(b))
-									} else {
-										slog.Debug("SpecDiff generated successfully", "len_diff", len(specDiff))
-									}
-								} else {
-									slog.Warn("bestSpec not found in prevDownloaded map")
 								}
-							} else {
-								fmt.Printf("prevTargetValid=%v, bestSpec=%s\n", prevTargetValid, bestSpec)
-								slog.Warn("failed to download previous spec file for diff", "error", err)
 							}
 						}
 					}
@@ -224,9 +233,11 @@ var rootCmd = &cobra.Command{
 					rawSource = expandMacros(rawSource, name, specSource.Version)
 
 					// Try to extract github repo from URL, then fallback to Source
-					githubOwner, githubRepo = parseGitHubOwnerRepo(specURL)
-					if githubOwner == "" || githubRepo == "" {
-						githubOwner, githubRepo = parseGitHubOwnerRepo(rawSource)
+					if needGitHub {
+						githubOwner, githubRepo = parseGitHubOwnerRepo(specURL)
+						if githubOwner == "" || githubRepo == "" {
+							githubOwner, githubRepo = parseGitHubOwnerRepo(rawSource)
+						}
 					}
 
 					if specSource.Name != "" {
@@ -246,7 +257,7 @@ var rootCmd = &cobra.Command{
 			}
 
 			// If we found a source that wasn't in our initial download list, download it now
-			if matchedSource != "" {
+			if needSourceArchive && matchedSource != "" {
 				if _, ok := downloadedBytes[matchedSource]; !ok {
 					sourceBytes, err := downloadFiles(creds, target, []string{matchedSource})
 					if err != nil {
@@ -259,7 +270,7 @@ var rootCmd = &cobra.Command{
 				}
 			}
 
-			if matchedSource != "" {
+			if needSourceArchive && matchedSource != "" {
 				if b, ok := downloadedBytes[matchedSource]; ok {
 					archiveChangelog, err = extractChangelogFromArchive(b, matchedSource, nLines)
 					if err != nil {
@@ -269,7 +280,7 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		if githubOwner != "" && githubRepo != "" {
+		if needGitHub && githubOwner != "" && githubRepo != "" {
 			githubReleaseNotes = fetchGitHubReleaseNotes(githubOwner, githubRepo, specSource.Version)
 			if githubReleaseNotes != "" {
 				githubReleaseNotes = extractFirstNLines(strings.NewReader(githubReleaseNotes), nLines)
@@ -287,6 +298,7 @@ var rootCmd = &cobra.Command{
 			Source:           matchedSource,
 			GitHubRelease:    githubReleaseNotes,
 			SpecDiff:         specDiff,
+			URL:              specURL,
 		}
 
 		if out.AddedFiles == nil {
@@ -297,6 +309,18 @@ var rootCmd = &cobra.Command{
 		}
 		if out.ExtractedFiles == nil {
 			out.ExtractedFiles = make(map[string]string)
+		}
+
+		if len(filters) > 0 {
+			if !matchFilters(&out, filters) {
+				fmt.Println(`{"error": "failed"}`)
+				os.Exit(1)
+			}
+		}
+
+		if len(fields) > 0 {
+			printFields(&out, fields)
+			return nil
 		}
 
 		outBytes, err := json.MarshalIndent(out, "", "  ")
@@ -321,6 +345,9 @@ func init() {
 	rootCmd.Flags().StringVarP(&cfgFile, "config", "c", "", "YAML config file containing list of files to extract")
 	rootCmd.Flags().IntVarP(&nLines, "n-lines", "n", 20, "Number of lines to extract from internal changelog")
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
+	rootCmd.Flags().StringSliceVarP(&filters, "filter", "f", nil, "Filter results (e.g. version=1.2.3, added_files=README)")
+	rootCmd.Flags().StringSliceVarP(&fields, "fields", "F", nil, "Fields to output if matched (e.g. version, changelog, spec_diff)")
+
 	viper.BindPFlag("config", rootCmd.Flags().Lookup("config"))
 	viper.BindPFlag("n_lines", rootCmd.Flags().Lookup("n-lines"))
 }
@@ -399,7 +426,7 @@ func extractChangelogFromArchive(archiveBytes []byte, filename string, n int) (s
 			slog.Debug("cpio file", "name", header.Name)
 			if isChangelogFile(header.Name) && header.Mode.IsRegular() {
 				slog.Debug("found changelog match in cpio", "name", header.Name)
-				return extractFirstNLines(cr, n), nil
+				return extractLatestChangelog(extractFirstNLines(cr, n+2)), nil
 			}
 		}
 	} else if strings.HasSuffix(filename, ".zip") {
@@ -417,7 +444,7 @@ func extractChangelogFromArchive(archiveBytes []byte, filename string, n int) (s
 				if err != nil {
 					return "", err
 				}
-				content := extractFirstNLines(rc, n)
+				content := extractLatestChangelog(extractFirstNLines(rc, n+2))
 				rc.Close()
 				return content, nil
 			}
@@ -425,7 +452,7 @@ func extractChangelogFromArchive(archiveBytes []byte, filename string, n int) (s
 	} else if isChangelogFile(filename) {
 		slog.Debug("file is a standalone changelog file")
 		// If the downloaded source is a standalone changelog file
-		return extractFirstNLines(r, n), nil
+		return extractLatestChangelog(extractFirstNLines(r, n+2)), nil
 	} else {
 		slog.Debug("using fallback tar archive reader")
 		// Fallback: assume tar for .tar, .tgz, .tbz2, .txz, or generic .gz/.bz2/.xz tarballs
@@ -442,7 +469,7 @@ func extractChangelogFromArchive(archiveBytes []byte, filename string, n int) (s
 			}
 			if isChangelogFile(header.Name) && header.Typeflag == tar.TypeReg {
 				slog.Debug("found changelog match in tar", "name", header.Name)
-				return extractFirstNLines(tr, n), nil
+				return extractLatestChangelog(extractFirstNLines(tr, n+2)), nil
 			}
 		}
 	}
@@ -571,6 +598,10 @@ func downloadFiles(creds *osc.OSCCredentials, target PackageTarget, filenames []
 
 func extractLatestChangelog(content string) string {
 	marker := "-------------------------------------------------------------------"
+	if !strings.Contains(content, marker) {
+		return strings.TrimSpace(content)
+	}
+
 	parts := strings.Split(content, marker)
 
 	for _, part := range parts {
@@ -702,4 +733,138 @@ func findSourceMatch(specSource SourceFile, entries []Entry) (SourceFile, bool) 
 	}
 
 	return res, false
+}
+
+func resolveAlias(path string) string {
+	aliases := map[string]string{
+		"package":              "Name",
+		"version":              "Version",
+		"changelog":            "Changelog",
+		"archive_changelog":    "ArchiveChangelog",
+		"added":                "AddedFiles",
+		"removed":              "RemovedFiles",
+		"source":               "Source",
+		"github_release_notes": "GitHubRelease",
+		"spec_diff":            "SpecDiff",
+		"url":                  "URL",
+	}
+	if resolved, ok := aliases[strings.ToLower(path)]; ok {
+		return resolved
+	}
+	return path
+}
+
+func extractValues(v reflect.Value, parts []string) []string {
+	if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
+
+	if len(parts) == 0 {
+		return []string{fmt.Sprintf("%v", v.Interface())}
+	}
+
+	part := strings.ReplaceAll(strings.ToLower(parts[0]), "_", "")
+
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			field := v.Type().Field(i)
+			fn := strings.ToLower(field.Name)
+			if fn == part || fn == part+"s" || fn+"s" == part {
+				return extractValues(v.Field(i), parts[1:])
+			}
+		}
+		return nil
+	case reflect.Slice, reflect.Array:
+		var res []string
+		for i := 0; i < v.Len(); i++ {
+			res = append(res, extractValues(v.Index(i), parts)...)
+		}
+		return res
+	case reflect.Map:
+		if v.Type().Key().Kind() == reflect.String {
+			key := reflect.ValueOf(parts[0])
+			val := v.MapIndex(key)
+			if val.IsValid() {
+				return extractValues(val, parts[1:])
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func getValues(out *Output, path string) []string {
+	path = resolveAlias(path)
+	parts := strings.Split(path, ".")
+	return extractValues(reflect.ValueOf(out), parts)
+}
+
+func matchFilters(out *Output, filters []string) bool {
+	for _, f := range filters {
+		parts := strings.SplitN(f, "=", 2)
+		if len(parts) != 2 {
+			slog.Warn("invalid filter format, expected key=value", "filter", f)
+			return false
+		}
+		key, expectedVal := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+
+		values := getValues(out, key)
+		matched := false
+		for _, val := range values {
+			if val == expectedVal {
+				matched = true
+				break
+			}
+		}
+
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+func printFields(out *Output, fields []string) {
+	res := make(map[string]any)
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+		values := getValues(out, f)
+		if len(values) == 1 {
+			res[f] = values[0]
+		} else {
+			res[f] = values
+		}
+	}
+
+	outBytes, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		fmt.Printf("{\"error\": \"failed to marshal fields: %v\"}\n", err)
+		return
+	}
+
+	fmt.Println(string(outBytes))
+}
+
+func isFieldNeeded(name string) bool {
+	if len(fields) == 0 {
+		return true
+	}
+	resolvedName := resolveAlias(name)
+	for _, f := range fields {
+		if resolveAlias(f) == resolvedName {
+			return true
+		}
+	}
+	for _, f := range filters {
+		parts := strings.SplitN(f, "=", 2)
+		if resolveAlias(parts[0]) == resolvedName {
+			return true
+		}
+	}
+	return false
 }
