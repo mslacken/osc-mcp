@@ -19,6 +19,7 @@ import (
 	"github.com/cavaliergopher/cpio"
 	"github.com/hbollon/go-edlib"
 	"github.com/openSUSE/osc-mcp/internal/pkg/osc"
+	"github.com/pmezard/go-difflib/difflib"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/ulikunitz/xz"
@@ -44,6 +45,7 @@ type Output struct {
 	ExtractedFiles   map[string]string `json:"extracted_files"`
 	Source           string            `json:"source"`
 	GitHubRelease    string            `json:"github_release_notes"`
+	SpecDiff         string            `json:"spec_diff"`
 }
 
 type RevisionList struct {
@@ -52,7 +54,8 @@ type RevisionList struct {
 }
 
 type Revision struct {
-	Rev string `xml:"rev,attr"`
+	Rev    string `xml:"rev,attr"`
+	SrcMD5 string `xml:"srcmd5"`
 }
 
 type Directory struct {
@@ -109,9 +112,12 @@ var rootCmd = &cobra.Command{
 		}
 
 		var prevFiles *Directory
+		var prevTarget PackageTarget
+		prevTargetValid := false
 		if prevRevision != "" {
-			prevTarget := target
+			prevTarget = target
 			prevTarget.Revision = prevRevision
+			prevTargetValid = true
 			prevFiles, err = getDirectory(creds, prevTarget)
 			if err != nil {
 				slog.Warn("failed to get previous directory, assuming none", "error", err)
@@ -158,6 +164,7 @@ var rootCmd = &cobra.Command{
 		var specURL string
 		var githubOwner, githubRepo string
 		var githubReleaseNotes string
+		var specDiff string
 
 		if len(filesToDownload) > 0 {
 			downloadedBytes, err := downloadFiles(creds, target, filesToDownload)
@@ -171,6 +178,41 @@ var rootCmd = &cobra.Command{
 
 			if bestSpec != "" {
 				if b, ok := downloadedBytes[bestSpec]; ok {
+					if prevTargetValid && prevFiles != nil {
+						hasPrevSpec := false
+						for _, e := range prevFiles.Entries {
+							if e.Name == bestSpec {
+								hasPrevSpec = true
+								break
+							}
+						}
+						if hasPrevSpec {
+							prevDownloaded, err := downloadFiles(creds, prevTarget, []string{bestSpec})
+							if err == nil {
+								if pb, pok := prevDownloaded[bestSpec]; pok {
+									diff := difflib.UnifiedDiff{
+										A:        difflib.SplitLines(string(pb)),
+										B:        difflib.SplitLines(string(b)),
+										FromFile: bestSpec + " (prev)",
+										ToFile:   bestSpec + " (curr)",
+										Context:  3,
+									}
+									specDiff, _ = difflib.GetUnifiedDiffString(diff)
+									if specDiff == "" {
+										slog.Debug("SpecDiff is empty, but files were downloaded", "len_pb", len(pb), "len_b", len(b))
+									} else {
+										slog.Debug("SpecDiff generated successfully", "len_diff", len(specDiff))
+									}
+								} else {
+									slog.Warn("bestSpec not found in prevDownloaded map")
+								}
+							} else {
+								fmt.Printf("prevTargetValid=%v, bestSpec=%s\n", prevTargetValid, bestSpec)
+								slog.Warn("failed to download previous spec file for diff", "error", err)
+							}
+						}
+					}
+
 					specValues := extractSourceFromSpec(string(b), []string{"Name", "Version", "Source", "URL"})
 					specSource.Version = specValues["Version"]
 					specSource.Name = specValues["Source"]
@@ -244,6 +286,7 @@ var rootCmd = &cobra.Command{
 			ExtractedFiles:   extracted,
 			Source:           matchedSource,
 			GitHubRelease:    githubReleaseNotes,
+			SpecDiff:         specDiff,
 		}
 
 		if out.AddedFiles == nil {
@@ -432,8 +475,9 @@ func getPreviousRevision(creds *osc.OSCCredentials, target PackageTarget) (strin
 	}
 
 	prev := ""
+	slog.Debug("revisions", "list", list.Revisions)
 	for _, r := range list.Revisions {
-		if r.Rev == target.Revision {
+		if r.Rev == target.Revision || r.SrcMD5 == target.Revision {
 			return prev, nil
 		}
 		prev = r.Rev

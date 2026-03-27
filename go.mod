@@ -13,6 +13,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.4.0
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/openSUSE/mcp-archive v0.1.3
+	github.com/pmezard/go-difflib v1.0.0
 	github.com/ppacher/go-dbus-keyring v1.0.1
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/pflag v1.0.10
@@ -30,7 +31,6 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/sagikazarmark/locafero v0.11.0 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect

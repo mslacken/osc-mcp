@@ -35,7 +35,7 @@ func fetchGitHubReleaseNotes(owner, repo, version string) string {
 	if owner == "" || repo == "" || version == "" {
 		return ""
 	}
-	
+
 	client := github.NewClient(nil)
 	ctx := context.Background()
 

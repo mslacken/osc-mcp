@@ -72,6 +72,30 @@ func TestGetRequest(t *testing.T) {
 		actualURL, err := url.Parse(r.URL.String())
 		assert.NoError(t, err)
 		if actualURL.Query().Has("cmd") {
+			if actualURL.Query().Has("view") {
+				expectedURL, err := url.Parse("/request/123?cmd=diff&view=xml")
+				assert.NoError(t, err)
+				assert.Equal(t, expectedURL.Query(), actualURL.Query())
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, `
+<request id="123" actions="1">
+  <action type="submit">
+    <sourcediff key="ed076e36735bdb6921e8e5a58c92a2b4">
+      <old project="home:testuser" package="testpackage" rev="1" srcmd5="oldmd5"/>
+      <new project="openSUSE:Factory" package="testpackage" rev="2" srcmd5="newmd5"/>
+      <files>
+        <file state="changed">
+          <old name="test.spec" md5="oldmd5" size="100"/>
+          <new name="test.spec" md5="newmd5" size="110"/>
+          <diff lines="2">@@ -1,1 +1,1 @@</diff>
+        </file>
+      </files>
+    </sourcediff>
+  </action>
+</request>
+`)
+				return
+			}
 			expectedURL, err := url.Parse("/request/123?cmd=diff")
 			assert.NoError(t, err)
 			assert.Equal(t, expectedURL.Query(), actualURL.Query())
@@ -116,6 +140,17 @@ func TestGetRequest(t *testing.T) {
 	assert.Equal(t, "1", request.Actions[0].Source.Rev)
 	assert.Equal(t, "openSUSE:Factory", request.Actions[0].Target.Project)
 	assert.Equal(t, "testpackage", request.Actions[0].Target.Package)
+
+	// Check sourcediff
+	assert.NotNil(t, request.Actions[0].SourceDiff)
+	assert.Equal(t, "ed076e36735bdb6921e8e5a58c92a2b4", request.Actions[0].SourceDiff.Key)
+	assert.Equal(t, "home:testuser", request.Actions[0].SourceDiff.Old.Project)
+	assert.Equal(t, "oldmd5", request.Actions[0].SourceDiff.Old.SrcMd5)
+	assert.Len(t, request.Actions[0].SourceDiff.Files, 1)
+	assert.Equal(t, "changed", request.Actions[0].SourceDiff.Files[0].State)
+	assert.Equal(t, "test.spec", request.Actions[0].SourceDiff.Files[0].Old.Name)
+	assert.Equal(t, "2", request.Actions[0].SourceDiff.Files[0].Diff.Lines)
+
 	assert.Len(t, request.Actions[0].Persons, 1)
 	assert.Equal(t, "testreviewer", request.Actions[0].Persons[0].Name)
 	assert.Equal(t, "reviewer", request.Actions[0].Persons[0].Role)
@@ -136,8 +171,6 @@ func TestGetRequest(t *testing.T) {
 	assert.Equal(t, "2025-09-22T11:00:00", request.Reviews[0].When)
 	assert.Equal(t, "testreviewer", request.Reviews[0].ByUser)
 }
-
-
 
 func TestGetRequest_Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

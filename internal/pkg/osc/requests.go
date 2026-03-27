@@ -47,7 +47,6 @@ type Request struct {
 	Description string          `xml:"description"`
 	Histories   []History       `xml:"history"`
 	Reviews     []Review        `xml:"review"`
-	Diff        string          `json:"diff,omitempty" xml:"-"`
 }
 
 type History struct {
@@ -84,12 +83,46 @@ type ShortRequest struct {
 }
 
 type RequestAction struct {
-	XMLName xml.Name        `xml:"action"`
-	Type    string          `xml:"type,attr"`
-	Source  RequestSource   `xml:"source"`
-	Target  RequestTarget   `xml:"target"`
-	Persons []RequestPerson `xml:"person"`
-	Groups  []RequestGroup  `xml:"group"`
+	XMLName    xml.Name        `xml:"action"`
+	Type       string          `xml:"type,attr"`
+	Source     RequestSource   `xml:"source"`
+	Target     RequestTarget   `xml:"target"`
+	Persons    []RequestPerson `xml:"person"`
+	Groups     []RequestGroup  `xml:"group"`
+	SourceDiff *SourceDiff     `xml:"sourcediff" json:"sourcediff,omitempty"`
+}
+
+type SourceDiff struct {
+	XMLName xml.Name   `xml:"sourcediff" json:"-"`
+	Key     string     `xml:"key,attr" json:"key,omitempty"`
+	Old     DiffNode   `xml:"old" json:"old,omitempty"`
+	New     DiffNode   `xml:"new" json:"new,omitempty"`
+	Files   []DiffFile `xml:"files>file" json:"files,omitempty"`
+}
+
+type DiffNode struct {
+	Project string `xml:"project,attr" json:"project,omitempty"`
+	Package string `xml:"package,attr" json:"package,omitempty"`
+	Rev     string `xml:"rev,attr" json:"rev,omitempty"`
+	SrcMd5  string `xml:"srcmd5,attr" json:"srcmd5,omitempty"`
+}
+
+type DiffFile struct {
+	State string        `xml:"state,attr" json:"state,omitempty"`
+	Old   *DiffFileInfo `xml:"old" json:"old,omitempty"`
+	New   *DiffFileInfo `xml:"new" json:"new,omitempty"`
+	Diff  *DiffLines    `xml:"diff" json:"diff,omitempty"`
+}
+
+type DiffFileInfo struct {
+	Name string `xml:"name,attr" json:"name,omitempty"`
+	Md5  string `xml:"md5,attr" json:"md5,omitempty"`
+	Size string `xml:"size,attr" json:"size,omitempty"`
+}
+
+type DiffLines struct {
+	Lines string `xml:"lines,attr" json:"lines,omitempty"`
+	Data  string `xml:",chardata" json:"data,omitempty"`
 }
 
 type RequestSource struct {
@@ -205,31 +238,32 @@ func (cred *OSCCredentials) ListRequests(ctx context.Context, req *mcp.CallToolR
 	return nil, &requests, nil
 }
 
-func (cred *OSCCredentials) getRequestDiff(ctx context.Context, requestId string) (string, error) {
-	diffURL := fmt.Sprintf("%s/request/%s?cmd=diff", cred.GetAPiAddr(), requestId)
-	slog.Debug("Getting request diff from OBS", "url", diffURL)
+func (cred *OSCCredentials) getStructuredRequestDiff(ctx context.Context, requestId string) (*Request, error) {
+	diffURL := fmt.Sprintf("%s/request/%s?cmd=diff&view=xml", cred.GetAPiAddr(), requestId)
+	slog.Debug("Getting structured request diff from OBS", "url", diffURL)
 
 	oscReq, err := cred.buildRequest(ctx, "POST", diffURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	resp, err := http.DefaultClient.Do(oscReq)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusNotFound {
-			return string(body), nil
+			return nil, nil // Not found is okay, no diff
 		}
-		return "", fmt.Errorf("failed to get request diff: status %s, body: %s", resp.Status, string(body))
+		return nil, fmt.Errorf("failed to get structured request diff: status %s, body: %s", resp.Status, string(body))
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+
+	var request Request
+	if err := xml.NewDecoder(resp.Body).Decode(&request); err != nil {
+		return nil, err
 	}
-	return string(body), nil
+	return &request, nil
 }
 
 func (cred *OSCCredentials) GetRequest(ctx context.Context, req *mcp.CallToolRequest, params GetRequestCmd) (*mcp.CallToolResult, *Request, error) {
@@ -265,12 +299,15 @@ func (cred *OSCCredentials) GetRequest(ctx context.Context, req *mcp.CallToolReq
 		return nil, nil, err
 	}
 
-	diff, err := cred.getRequestDiff(ctx, params.Id)
+	structuredDiffReq, err := cred.getStructuredRequestDiff(ctx, params.Id)
 	if err != nil {
-		slog.Warn("could not get request diff", "err", err, "request_id", params.Id)
-		request.Diff = fmt.Sprintf("Could not retrieve diff: %v", err)
-	} else {
-		request.Diff = diff
+		slog.Warn("could not get structured request diff", "err", err, "request_id", params.Id)
+	} else if structuredDiffReq != nil {
+		for i := range request.Actions {
+			if i < len(structuredDiffReq.Actions) && structuredDiffReq.Actions[i].SourceDiff != nil {
+				request.Actions[i].SourceDiff = structuredDiffReq.Actions[i].SourceDiff
+			}
+		}
 	}
 
 	if request.Actions == nil {

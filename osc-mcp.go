@@ -257,7 +257,7 @@ func main() {
 		{
 			Tool: &mcp.Tool{
 				Name:        "get_request",
-				Description: "Get a single request by its ID. Includes a diff to what has changed in that request.",
+				Description: "Get a single request by its ID. Includes a structured diff detailing changed files and line diffs.",
 			},
 			Register: func(server *mcp.Server, tool *mcp.Tool) {
 				mcp.AddTool(server, tool, obsCred.GetRequest)

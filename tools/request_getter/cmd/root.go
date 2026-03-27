@@ -40,7 +40,7 @@ Output Fields (-F, --fields):
   those values are comma-separated.
 
 Available Fields (traversable via dot notation, case-insensitive):
-  - id, creator (alias: user), created, description, diff
+  - id, creator (alias: user), created, description
   - state
     - name (alias: state), who, when, superseded
   - actions (alias: action)
@@ -56,7 +56,7 @@ Available Fields (traversable via dot notation, case-insensitive):
     - who, when, comment
 
 Note: Array indexing is automatic. 'actions.type' returns the types of all actions.`,
-	Args:  cobra.ExactArgs(1),
+	Args: cobra.ExactArgs(1),
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		logLevel := slog.LevelInfo
 		if debug {
