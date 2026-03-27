@@ -30,14 +30,13 @@ var rootCmd = &cobra.Command{
 
 Filtering (-f, --filter):
   You can filter requests by specifying key=value pairs (e.g., -f state=accepted).
-  If the request does not match ALL filters, the program exits with status 1 and prints "failed".
+  If the request does not match ALL filters, the program exits with status 1 and prints an error object (e.g., {"error": "failed"}).
   For array fields (like actions or reviews), the filter matches if ANY element in the array matches.
   All values in the request object can be filtered using dot notation (e.g., actions.source.package=enigma).
 
 Output Fields (-F, --fields):
   Specify a comma-separated list of fields to output if the request matches the filters.
-  Values are printed space-separated. If a field results in multiple values (e.g., querying an array),
-  those values are comma-separated.
+  Values are output as a structured JSON/YAML map where the keys are the requested fields and the values are arrays of extracted strings.
 
 Available Fields (traversable via dot notation, case-insensitive):
   - id, creator (alias: user), created, description
@@ -91,14 +90,17 @@ Note: Array indexing is automatic. 'actions.type' returns the types of all actio
 
 		if len(filters) > 0 {
 			if !matchFilters(request, filters) {
-				fmt.Println("failed")
+				if output == "yaml" {
+					fmt.Println("error: failed")
+				} else {
+					fmt.Println(`{"error": "failed"}`)
+				}
 				os.Exit(1)
 			}
 		}
 
 		if len(fields) > 0 {
-			printFields(request, fields)
-			return nil
+			return printFields(request, fields, output)
 		}
 
 		var out []byte
@@ -204,14 +206,27 @@ func matchFilters(req *osc.Request, filters []string) bool {
 	return true
 }
 
-func printFields(req *osc.Request, fields []string) {
-	var out []string
+func printFields(req *osc.Request, fields []string, outputFormat string) error {
+	res := make(map[string][]string)
 	for _, f := range fields {
 		f = strings.TrimSpace(f)
-		values := getValues(req, f)
-		out = append(out, strings.Join(values, ","))
+		res[f] = getValues(req, f)
 	}
-	fmt.Println(strings.Join(out, " "))
+
+	var out []byte
+	var err error
+	if outputFormat == "yaml" {
+		out, err = yaml.Marshal(res)
+	} else {
+		out, err = json.MarshalIndent(res, "", "  ")
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to marshal fields: %w", err)
+	}
+
+	fmt.Println(string(out))
+	return nil
 }
 
 func Execute() {

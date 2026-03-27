@@ -106,37 +106,46 @@ def main():
         
         output = run_command(cmd)
         
-        if not output or output == "failed":
-            print("Skipped (not accepted to Factory or failed).")
+        if not output:
+            print("Skipped (no output from request_getter).")
         else:
-            # Output format: "proj1,proj2 pkg1,pkg2 rev1,rev2"
             try:
-                parts = output.split()
-                if len(parts) >= 3:
-                    # Take first element if multiple actions exist
-                    project = parts[0].split(',')[0]
-                    package = parts[1].split(',')[0]
-                    revision = parts[2].split(',')[0]
-
-                    print(f"Found! Fetching changelog for {project}/{package}@{revision}...", end=" ", flush=True)
-                    
-                    # 2. Extract changelog data
-                    cmd_ext = [changelog_ext, project, package, revision]
-                    ext_output = run_command(cmd_ext)
-                    
-                    if ext_output:
-                        try:
-                            data = json.loads(ext_output)
-                            data["request_id"] = req_id
-                            append_to_json_list(args.output, data)
-                            print("Done.")
-                            success_count += 1
-                        except json.JSONDecodeError:
-                            print("Error parsing changelog extractor output.")
-                    else:
-                        print("Failed to extract changelog.")
+                data = json.loads(output)
+                if "error" in data:
+                    print("Skipped (not accepted to Factory or failed).")
                 else:
-                    print(f"Unexpected output format from request_getter: {output}")
+                    # Extract fields from JSON map (they are arrays of strings)
+                    project_list = data.get("source.project", [])
+                    package_list = data.get("package", [])
+                    revision_list = data.get("revision", [])
+
+                    if project_list and package_list and revision_list:
+                        # Take first element if multiple actions exist
+                        project = project_list[0]
+                        package = package_list[0]
+                        revision = revision_list[0]
+
+                        print(f"Found! Fetching changelog for {project}/{package}@{revision}...", end=" ", flush=True)
+                        
+                        # 2. Extract changelog data
+                        cmd_ext = [changelog_ext, project, package, revision]
+                        ext_output = run_command(cmd_ext)
+                        
+                        if ext_output:
+                            try:
+                                data_ext = json.loads(ext_output)
+                                data_ext["request_id"] = req_id
+                                append_to_json_list(args.output, data_ext)
+                                print("Done.")
+                                success_count += 1
+                            except json.JSONDecodeError:
+                                print("Error parsing changelog extractor output.")
+                        else:
+                            print("Failed to extract changelog.")
+                    else:
+                        print(f"Missing required fields in request_getter output: {output}")
+            except json.JSONDecodeError:
+                print(f"Unexpected non-JSON output from request_getter: {output}")
             except Exception as e:
                 print(f"Error processing output: {e}")
 
