@@ -59,7 +59,7 @@ def append_to_json_list(file_path: str, data: dict):
     os.replace(temp_path, file_path)
 
 def clean_obs_diff(diff_text: str) -> str:
-    """Removes the OBS limiter line and the subsequent author/date line from diffs."""
+    """Removes the OBS limiter line, author/date line, diff hunk headers, and empty lines from diffs."""
     if not diff_text:
         return ""
     
@@ -74,6 +74,8 @@ def clean_obs_diff(diff_text: str) -> str:
             continue
         if skip_next:
             skip_next = False
+            continue
+        if line.startswith("@@") or not line.strip():
             continue
         new_lines.append(line)
     
@@ -111,6 +113,7 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
             # Extract more from sourcediff
             changed_files = []
             removed_files = []
+            added_files = []
             spec_diff = ""
             changes_diff = ""
 
@@ -126,7 +129,9 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
 
                     if name:
                         top_level = name.split('/')[0]
-                        if top_level not in changed_files:
+                        if not old_name and top_level not in added_files:
+                            added_files.append(top_level)
+                        if top_level not in changed_files and top_level not in added_files:
                             changed_files.append(top_level)
                         
                         if '/' in name:
@@ -144,7 +149,7 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
             print(f"Found! Fetching changelog for {project}/{package}@{revision}...", end=" ", flush=True)
 
             # 2. Extract changelog data
-            fields_ext = "source,archive_changelog,url,github_release_notes"
+            fields_ext = "version,source,archive_changelog,url,github_release_notes"
             cmd_ext = [changelog_ext, project, package, revision, "-F", fields_ext]
             ext_output = run_command(cmd_ext)
 
@@ -156,9 +161,10 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
                         "request_id": req_id,
                         "project": project,
                         "package": package,
-                        "revision": revision,
+                        "version": data_ext.get("version"),
                         "changed_files": changed_files,
                         "removed_files": removed_files,
+                        "added_files": added_files,
                         "spec_diff": clean_obs_diff(spec_diff),
                         "changes_diff": clean_obs_diff(changes_diff),
                         "source_file": data_ext.get("source"),
@@ -183,6 +189,40 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
         print(f"Error processing output for {req_id}: {e}")
     return False
 
+def load_existing_ids(output_file: str, failed_file: str):
+    """Loads request IDs that are already processed or marked as failed."""
+    success_ids = set()
+    failed_ids = set()
+
+    if os.path.exists(output_file):
+        try:
+            with open(output_file, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and "request_id" in item:
+                            success_ids.add(item["request_id"])
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    if os.path.exists(failed_file):
+        try:
+            with open(failed_file, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    failed_ids = set(data)
+        except (json.JSONDecodeError, IOError):
+            pass
+    
+    return success_ids, failed_ids
+
+def save_failed_ids(failed_file: str, failed_ids: set):
+    """Saves the set of failed IDs to a JSON file."""
+    temp_path = failed_file + ".tmp"
+    with open(temp_path, 'w') as f:
+        json.dump(sorted(list(failed_ids)), f, indent=2)
+    os.replace(temp_path, failed_file)
+
 def main():
     parser = argparse.ArgumentParser(description="Collect data from OBS requests.")
     parser.add_argument("n0", type=int, nargs='?', help="Lower bound of request IDs (optional if --request is used)")
@@ -192,6 +232,7 @@ def main():
     parser.add_argument("--bypass", action="store_true", help="Only generate random numbers and exit")
     parser.add_argument("--sigma", type=float, help="Sigma for Gaussian distribution (default: (n1-n0)/2)")
     parser.add_argument("--output", default="changes.json", help="Output JSON file")
+    parser.add_argument("--failed-file", default="failed.json", help="File to store failed request IDs")
     parser.add_argument("--count", type=int, default=10, help="Number of requests to try")
 
     args = parser.parse_args()
@@ -210,8 +251,10 @@ def main():
     changelog_ext = "bin/changelog_extractor"
 
     missing = []
-    if not os.path.exists(req_getter): missing.append(req_getter)
-    if not os.path.exists(changelog_ext): missing.append(changelog_ext)
+    if not os.path.exists(req_getter):
+        missing.append(req_getter)
+    if not os.path.exists(changelog_ext):
+        missing.append(changelog_ext)
 
     if missing:
         print(f"Error: Missing binaries: {', '.join(missing)}")
@@ -222,9 +265,21 @@ def main():
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    success_ids, failed_ids = load_existing_ids(args.output, args.failed_file)
+    print(f"Loaded {len(success_ids)} successful and {len(failed_ids)} failed IDs.")
+
     if args.request:
+        if args.request in success_ids:
+            print(f"Request {args.request} already in {args.output}. Skipping.")
+            return
+        
         print(f"Checking single request {args.request}...", end=" ", flush=True)
-        process_request(args.request, req_getter, changelog_ext, args.output)
+        if process_request(args.request, req_getter, changelog_ext, args.output):
+            print("Success.")
+        else:
+            failed_ids.add(args.request)
+            save_failed_ids(args.failed_file, failed_ids)
+            print("Failed.")
         return
 
     if args.n0 is None or args.n1 is None:
@@ -232,20 +287,31 @@ def main():
         sys.exit(1)
 
     success_count = 0
+    unsuccessful_count = 0
     attempts = 0
 
     while success_count < args.count:
         req_id = get_truncated_gauss(args.n0, args.n1, args.sigma)
+        
+        if req_id in success_ids or req_id in failed_ids:
+            continue
+
         attempts += 1
         print(f"Attempt {attempts}: Checking request {req_id}...", end=" ", flush=True)
 
         if process_request(req_id, req_getter, changelog_ext, args.output):
             success_count += 1
+            success_ids.add(req_id)
+        else:
+            unsuccessful_count += 1
+            failed_ids.add(req_id)
+            save_failed_ids(args.failed_file, failed_ids)
 
         if success_count < args.count:
             time.sleep(args.rate_limit)
 
     print(f"\nSuccessfully collected {success_count} entries to {args.output}")
+    print(f"Unsuccessful attempts in this session: {unsuccessful_count}")
 
 if __name__ == "__main__":
     main()
