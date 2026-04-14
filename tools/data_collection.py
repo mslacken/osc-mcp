@@ -122,6 +122,8 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
             added_files = []
             spec_diff = ""
             changes_diff = ""
+            service_diff = ""
+            multibuilddiff = ""
 
             sourcediff = action.get("SourceDiff", {}) or action.get("sourcediff", {})
             if sourcediff:
@@ -147,6 +149,10 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
                             spec_diff = diff_data
                         elif name.endswith(".changes"):
                             changes_diff = diff_data
+                        elif name == "_service":
+                            service_diff = diff_data
+                        elif name == "_multibuild":
+                            multibuilddiff = diff_data
                     elif old_name:
                         top_level = old_name.split('/')[0]
                         if top_level not in removed_files:
@@ -186,6 +192,8 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
                         "added_files": added_files,
                         "spec_diff": clean_obs_diff(spec_diff),
                         "changes_diff": clean_obs_diff(changes_diff),
+                        "multibuild_diff": clean_obs_diff(multibuilddiff),
+                        "service_diff": clean_obs_diff(service_diff),
                         "source_file": data_ext.get("source"),
                         "archive_changelog": archive_cl,
                         "url": data_ext.get("url"),
