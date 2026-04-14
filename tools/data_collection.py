@@ -22,13 +22,15 @@ def get_truncated_gauss(n0: int, n1: int, sigma: float = None) -> int:
         if n0 <= val <= n1:
             return int(round(val))
 
-def run_command(cmd: List[str]) -> Optional[str]:
+def run_command(cmd: List[str], timeout: Optional[float] = None) -> Optional[str]:
     """Runs a shell command and returns stdout if successful, else None."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
         return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        raise
     except subprocess.CalledProcessError as e:
-        if "failed" in e.stdout:
+        if e.stdout and "failed" in e.stdout:
             return None
         # Other errors might be real issues
         return None
@@ -81,12 +83,16 @@ def clean_obs_diff(diff_text: str) -> str:
     
     return "\n".join(new_lines).strip()
 
-def process_request(req_id: int, req_getter: str, changelog_ext: str, output_file: str) -> bool:
+def process_request(req_id: int, req_getter: str, changelog_ext: str, output_file: str, timeout: Optional[float] = None) -> bool:
     """Processes a single request ID. Returns True if successful and data was appended."""
     # 1. Check if request is accepted to Factory and get source details
     cmd = [req_getter, str(req_id), "-f", "state=accepted", "-f", "target=openSUSE:Factory"]
     
-    output = run_command(cmd)
+    try:
+        output = run_command(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print("Skipped (timeout reached while checking request).")
+        return False
     
     if not output:
         print("Skipped (no output from request_getter).")
@@ -151,11 +157,24 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
             # 2. Extract changelog data
             fields_ext = "version,source,archive_changelog,url,github_release_notes"
             cmd_ext = [changelog_ext, project, package, revision, "-F", fields_ext]
-            ext_output = run_command(cmd_ext)
+            
+            try:
+                ext_output = run_command(cmd_ext, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                print("Failed (timeout reached while extracting changelog).")
+                return False
 
             if ext_output:
                 try:
                     data_ext = json.loads(ext_output)
+                    
+                    archive_cl = data_ext.get("archive_changelog")
+                    github_rn = data_ext.get("github_release_notes")
+                    
+                    if not archive_cl and not github_rn:
+                        print("Skipped (empty changelog and release notes).")
+                        return False
+
                     # Combine data
                     final_data = {
                         "request_id": req_id,
@@ -168,9 +187,9 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
                         "spec_diff": clean_obs_diff(spec_diff),
                         "changes_diff": clean_obs_diff(changes_diff),
                         "source_file": data_ext.get("source"),
-                        "archive_changelog": data_ext.get("archive_changelog"),
+                        "archive_changelog": archive_cl,
                         "url": data_ext.get("url"),
-                        "github_release_notes": data_ext.get("github_release_notes")
+                        "github_release_notes": github_rn
                     }
                     append_to_json_list(output_file, final_data)
                     print("Done.")
@@ -189,14 +208,20 @@ def process_request(req_id: int, req_getter: str, changelog_ext: str, output_fil
         print(f"Error processing output for {req_id}: {e}")
     return False
 
-def load_existing_ids(output_file: str, failed_file: str):
+def load_existing_ids(output_file: str, failed_file: str, extra_sources: List[str] = None):
     """Loads request IDs that are already processed or marked as failed."""
     success_ids = set()
     failed_ids = set()
 
-    if os.path.exists(output_file):
+    sources = [output_file]
+    if extra_sources:
+        sources.extend(extra_sources)
+
+    for source in set(sources):
+        if not source or not os.path.exists(source):
+            continue
         try:
-            with open(output_file, 'r') as f:
+            with open(source, "r") as f:
                 data = json.load(f)
                 if isinstance(data, list):
                     for item in data:
@@ -207,13 +232,13 @@ def load_existing_ids(output_file: str, failed_file: str):
 
     if os.path.exists(failed_file):
         try:
-            with open(failed_file, 'r') as f:
+            with open(failed_file, "r") as f:
                 data = json.load(f)
                 if isinstance(data, list):
                     failed_ids = set(data)
         except (json.JSONDecodeError, IOError):
             pass
-    
+
     return success_ids, failed_ids
 
 def save_failed_ids(failed_file: str, failed_ids: set):
@@ -234,6 +259,7 @@ def main():
     parser.add_argument("--output", default="changes.json", help="Output JSON file")
     parser.add_argument("--failed-file", default="failed.json", help="File to store failed request IDs")
     parser.add_argument("--count", type=int, default=10, help="Number of requests to try")
+    parser.add_argument("--timeout", type=float, default=30.0, help="Timeout for commands in seconds")
 
     args = parser.parse_args()
 
@@ -265,16 +291,16 @@ def main():
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    success_ids, failed_ids = load_existing_ids(args.output, args.failed_file)
+    success_ids, failed_ids = load_existing_ids(args.output, args.failed_file, ["changes.json"])
     print(f"Loaded {len(success_ids)} successful and {len(failed_ids)} failed IDs.")
 
     if args.request:
         if args.request in success_ids:
-            print(f"Request {args.request} already in {args.output}. Skipping.")
+            print(f"Request {args.request} already processed. Skipping.")
             return
         
         print(f"Checking single request {args.request}...", end=" ", flush=True)
-        if process_request(args.request, req_getter, changelog_ext, args.output):
+        if process_request(args.request, req_getter, changelog_ext, args.output, timeout=args.timeout):
             print("Success.")
         else:
             failed_ids.add(args.request)
@@ -297,9 +323,9 @@ def main():
             continue
 
         attempts += 1
-        print(f"Attempt {attempts}: Checking request {req_id}...", end=" ", flush=True)
+        print(f"Attempt: {attempts} Count: {success_count} Checking request: {req_id}...", end=" ", flush=True)
 
-        if process_request(req_id, req_getter, changelog_ext, args.output):
+        if process_request(req_id, req_getter, changelog_ext, args.output, timeout=args.timeout):
             success_count += 1
             success_ids.add(req_id)
         else:
